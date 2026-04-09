@@ -30,17 +30,17 @@ LIMITS: Dict[str, int] = {
 
 # Emeralds
 EM_FV = 10_000
-EM_EDGE = 7           
-EM_TAKE = 1           
-EM_SKEW = 0.15        
+EM_EDGE = 7
+EM_TAKE = 1
+EM_SKEW = 0.15
 
 # Tomatoes
-TOM_ALPHA = 0.50      
-TOM_TAKE = 2          
-TOM_MIN_EDGE = 3      
-TOM_SPREAD_OFF = 2    
-TOM_SKEW = 0.50       
-INNER_RATIO = 0.65    
+TOM_ALPHA = 0.50
+TOM_TAKE = 1
+TOM_MIN_EDGE = 4
+TOM_SPREAD_OFF = 2
+TOM_SKEW = 0.40
+INNER_RATIO = 0.65
 
 
 class Trader:
@@ -63,15 +63,15 @@ class Trader:
         lim = LIMITS[product]
         return lim - pos, lim + pos          # buy_cap, sell_cap
 
-    # aggressive sweep (take mispriced book orders) 
+    # aggressive sweep (take mispriced book orders)
     @staticmethod
     def _sweep(
-        product: str,
-        fv: float,
-        threshold: float,
-        od: OrderDepth,
-        buy_cap: int,
-        sell_cap: int,
+            product: str,
+            fv: float,
+            threshold: float,
+            od: OrderDepth,
+            buy_cap: int,
+            sell_cap: int,
     ) -> Tuple[List[Order], int, int]:
         orders: List[Order] = []
         for ask in sorted(od.sell_orders):
@@ -90,16 +90,16 @@ class Trader:
                 sell_cap -= vol
         return orders, buy_cap, sell_cap
 
-    #  single-level market making (EMERALDS) 
+    #  single-level market making (EMERALDS)
     @staticmethod
     def _make_single(
-        product: str,
-        fv: float,
-        edge: int,
-        skew_factor: float,
-        pos: int,
-        buy_cap: int,
-        sell_cap: int,
+            product: str,
+            fv: float,
+            edge: int,
+            skew_factor: float,
+            pos: int,
+            buy_cap: int,
+            sell_cap: int,
     ) -> List[Order]:
         lim = LIMITS[product]
         skew = -int(skew_factor * edge * pos / lim)
@@ -117,17 +117,17 @@ class Trader:
             orders.append(Order(product, ask, -sell_cap))
         return orders
 
-    # two-level market making (TOMATOES) 
+    # two-level market making (TOMATOES)
     @staticmethod
     def _make_two_level(
-        product: str,
-        fv: float,
-        edge_inner: int,
-        edge_outer: int,
-        skew_factor: float,
-        pos: int,
-        buy_cap: int,
-        sell_cap: int,
+            product: str,
+            fv: float,
+            edge_inner: int,
+            edge_outer: int,
+            skew_factor: float,
+            pos: int,
+            buy_cap: int,
+            sell_cap: int,
     ) -> List[Order]:
         lim = LIMITS[product]
         skew = -int(skew_factor * edge_inner * pos / lim)
@@ -160,7 +160,7 @@ class Trader:
                 orders.append(Order(product, ask2, -q2))
         return orders
 
-    # main entry 
+    # main entry
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
         saved: Dict[str, float] = {}
         if state.traderData:
@@ -196,8 +196,8 @@ class Trader:
                 # EMA fair value
                 wmid = self._weighted_mid(od)
                 saved[product] = (
-                    TOM_ALPHA * wmid
-                    + (1.0 - TOM_ALPHA) * saved.get(product, wmid)
+                        TOM_ALPHA * wmid
+                        + (1.0 - TOM_ALPHA) * saved.get(product, wmid)
                 )
                 fv = saved[product]
 
@@ -213,11 +213,11 @@ class Trader:
                 half_spread = (best_ask - best_bid) // 2
                 make_edge = max(TOM_MIN_EDGE, half_spread - TOM_SPREAD_OFF)
 
-                # Two-level market making (outer = inner + 1)
+                # Two-level market making (outer = inner + 2)
                 orders += self._make_two_level(
-                    product, fv, make_edge, make_edge + 1,
+                    product, fv, make_edge, make_edge + 2,
                     TOM_SKEW, pos, buy_cap, sell_cap,
-                )
+                                            )
 
             if orders:
                 result[product] = orders

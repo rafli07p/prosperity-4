@@ -1,75 +1,65 @@
-"""
-EMERALDS
-  Fair value is a constant 10,000 (mean=10000.00, std=0.72 over 20,000 rows).
-  Bot quotes sit at FV ± 8 (bid=9992, ask=10008).  We post at FV ± 7 — one
-  tick inside the bot spread — making us the unique best bid/ask.  Every market
-  trade fills us at our price (9993 or 10007), giving 7 SeaShells per unit.
-  No taking needed: no price ever crosses FV, so there is no arb to sweep.
+from __future__ import annotations
 
-TOMATOES
-  Fair value drifts (autocorr 0.997).  We estimate it with a fast EMA (α=0.50)
-  applied to the volume-weighted mid.  Bot spread ≈ 13 ticks; we quote ± 6,
-  which is tight enough to win flow but not so tight we invert the book when
-  the EMA lags.  Inventory skew prevents runaway directional exposure.
-"""
+try:
+    from datamodel import Order, OrderDepth, TradingState  # type: ignore[import]
+except ModuleNotFoundError:
+    class Order:
+        def __init__(self, symbol: str, price: int, quantity: int) -> None:
+            self.symbol = symbol
+            self.price = price
+            self.quantity = quantity
 
-from datamodel import OrderDepth, TradingState, Order
+    class OrderDepth:
+        def __init__(self) -> None:
+            self.buy_orders: dict[int, int] = {}
+            self.sell_orders: dict[int, int] = {}
+
+    class TradingState:
+        def __init__(self) -> None:
+            self.traderData: str = ""
+            self.position: dict[str, int] = {}
+            self.order_depths: dict[str, OrderDepth] = {}
+
 from typing import Dict, List, Tuple
 import json
 
-# Parameters
 LIMITS: Dict[str, int] = {
     "EMERALDS": 80,
     "TOMATOES": 80,
 }
 
-# Emeralds, constant FV, bot spread = ±8, so we sit ±7 (inside, maximise $/fill)
-EMERALDS_FV   = 10_000
-EMERALDS_EDGE = 7          # bid=9993, ask=10007
+EMERALDS_FV = 10_000
+EMERALDS_EDGE = 7
 
-# Tomatoes, adaptive FV via weighted-mid EMA
-TOMATOES_ALPHA = 0.50      # fast EMA; empirically beats α∈{0.05…0.35} on this data
-TOMATOES_EDGE  = 6         # bot half-spread ≈ 6.5; we match it for max fill rate
+TOMATOES_ALPHA = 0.50
+TOMATOES_EDGE = 6
 
-# Inventory skew: shifts both quotes toward mean-reversion
-SKEW_FACTOR = 0.5          # max adjustment = SKEW_FACTOR × EDGE ticks at full pos
+SKEW_FACTOR = 0.5
 
-
-# Trader
 
 class Trader:
 
-    # Helpers
-
     @staticmethod
-    def _wmid(od: OrderDepth) -> float:
-        """
-        Volume-weighted mid-price.
-        Weights each side by the OPPOSITE side's volume, giving a directional
-        lean: heavy ask-side pressure → wmid drifts below simple mid.
-        Beats simple mid by ~6 % on TOMATOES next-tick MAE.
-        """
+    def _weighted_mid(od: OrderDepth) -> float:
         best_bid = max(od.buy_orders)
         best_ask = min(od.sell_orders)
-        bv = od.buy_orders[best_bid]       # volume at best bid
-        av = -od.sell_orders[best_ask]     # volume at best ask (stored as negative)
-        return (best_bid * av + best_ask * bv) / (bv + av)
+        bid_vol = od.buy_orders[best_bid]
+        ask_vol = -od.sell_orders[best_ask]
+        return (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
 
     @staticmethod
     def _capacities(product: str, state: TradingState) -> Tuple[int, int]:
-        pos   = state.position.get(product, 0)
+        pos = state.position.get(product, 0)
         limit = LIMITS[product]
         return limit - pos, limit + pos
 
-    # Order Generation
-
     @staticmethod
     def _sweep(
-            product:  str,
-            fv:       float,
+            product: str,
+            fv: float,
             min_edge: float,
-            od:       OrderDepth,
-            buy_cap:  int,
+            od: OrderDepth,
+            buy_cap: int,
             sell_cap: int,
     ) -> Tuple[List[Order], int, int]:
         orders: List[Order] = []
@@ -94,40 +84,37 @@ class Trader:
 
     @staticmethod
     def _make(
-            product:  str,
-            fv:       float,
-            edge:     int,
-            pos:      int,
-            buy_cap:  int,
+            product: str,
+            fv: float,
+            edge: int,
+            pos: int,
+            buy_cap: int,
             sell_cap: int,
     ) -> List[Order]:
-        limit    = LIMITS[product]
-        skew     = -int(SKEW_FACTOR * edge * pos / limit)
+        limit = LIMITS[product]
+        skew = -int(SKEW_FACTOR * edge * pos / limit)
 
         bid_price = round(fv) - edge + skew
         ask_price = round(fv) + edge + skew
 
-        # Safety guard: never cross the spread (can happen at extreme inventory)
         if bid_price >= ask_price:
             bid_price = round(fv) - 1
             ask_price = round(fv) + 1
 
         orders: List[Order] = []
         if buy_cap > 0:
-            orders.append(Order(product, bid_price,  buy_cap))
+            orders.append(Order(product, bid_price, buy_cap))
         if sell_cap > 0:
             orders.append(Order(product, ask_price, -sell_cap))
         return orders
 
-    # Main Entry Point
-
-    def run(self, state: TradingState):
+    def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
         ema: Dict[str, float] = {}
         if state.traderData:
             try:
                 ema = json.loads(state.traderData)
-            except Exception:
-                pass
+            except (json.JSONDecodeError, ValueError, TypeError):
+                ema = {}
 
         result: Dict[str, List[Order]] = {}
 
@@ -135,36 +122,29 @@ class Trader:
             if not od.buy_orders or not od.sell_orders:
                 continue
 
-            pos              = state.position.get(product, 0)
+            pos = state.position.get(product, 0)
             buy_cap, sell_cap = self._capacities(product, state)
             orders: List[Order] = []
 
-            # Emeralds
             if product == "EMERALDS":
-                # Constant FV; no sweeping needed (zero arb exists in data).
-                # Post full remaining capacity at FV ± 7 (inside bot's ± 8).
                 orders += self._make(
                     product, float(EMERALDS_FV), EMERALDS_EDGE,
                     pos, buy_cap, sell_cap,
                 )
 
-            # Tomatoes
             elif product == "TOMATOES":
-                # Fair-value: fast EMA of volume-weighted mid
-                wmid = self._wmid(od)
+                weighted_mid = self._weighted_mid(od)
                 ema[product] = (
-                        TOMATOES_ALPHA * wmid
-                        + (1.0 - TOMATOES_ALPHA) * ema.get(product, wmid)
+                        TOMATOES_ALPHA * weighted_mid
+                        + (1.0 - TOMATOES_ALPHA) * ema.get(product, weighted_mid)
                 )
                 fv = ema[product]
 
-                # Pass 1: sweep fat-tail mispricings (≥ 1.5 × edge from FV)
-                take_thresh = TOMATOES_EDGE * 1.5
+                take_threshold = TOMATOES_EDGE * 1.5
                 orders, buy_cap, sell_cap = self._sweep(
-                    product, fv, take_thresh, od, buy_cap, sell_cap,
+                    product, fv, take_threshold, od, buy_cap, sell_cap,
                 )
 
-                # Pass 2: post remaining capacity as resting quotes
                 orders += self._make(
                     product, fv, TOMATOES_EDGE,
                     pos, buy_cap, sell_cap,
@@ -173,7 +153,6 @@ class Trader:
             if orders:
                 result[product] = orders
 
-        # 2. Persist updated EMA for next tick
         trader_data = json.dumps(ema)
 
         return result, 0, trader_data

@@ -23,30 +23,24 @@ except ModuleNotFoundError:
 from typing import Dict, List, Tuple
 import json
 
-LIMITS: Dict[str, int] = {
-    "EMERALDS": 80,
-    "TOMATOES": 80,
-}
+LIMITS: Dict[str, int] = {"EMERALDS": 80, "TOMATOES": 80}
 
-# ── EMERALDS: stationary at 10000, spread 16 (bots at 9992/10008) ──
 EM_FV = 10_000
-EM_EDGE = 7           # 1 tick inside bot spread → captures all market trades at max edge
-EM_TAKE = 1           # sweep mispriced orders (asks ≤ 9999, bids ≥ 10001)
-EM_SKEW = 0.15        # light skew: stationary asset has no inventory risk
+EM_EDGE = 7
+EM_TAKE = 1
+EM_SKEW = 0.15
 
-# ── TOMATOES: drifts, mean-reverts at lag-1 (autocorr −0.40) ──────
-TOM_ALPHA = 0.50      # EMA alpha for fair-value tracking
-TOM_TAKE = 2          # sweep threshold (ticks from FV)
-TOM_MIN_EDGE = 3      # minimum market-making edge
-TOM_SPREAD_OFF = 2    # make_edge = max(MIN_EDGE, half_spread − OFF)
-TOM_SKEW = 0.50       # stronger skew: drift creates real inventory risk
+TOM_ALPHA = 0.50
+TOM_TAKE = 1
+TOM_MIN_EDGE = 4
+TOM_SPREAD_OFF = 2
+TOM_SKEW = 0.40
 
-INNER_RATIO = 0.65    # two-level quoting: fraction of volume on inner level
+INNER_RATIO = 0.65
 
 
 class Trader:
 
-    # ── fair-value helpers ─────────────────────────────────────────
     @staticmethod
     def _weighted_mid(od: OrderDepth) -> float:
         best_bid = max(od.buy_orders)
@@ -62,9 +56,8 @@ class Trader:
     def _caps(product: str, state: TradingState) -> Tuple[int, int]:
         pos = state.position.get(product, 0)
         lim = LIMITS[product]
-        return lim - pos, lim + pos          # buy_cap, sell_cap
+        return lim - pos, lim + pos
 
-    # ── aggressive sweep (take mispriced book orders) ──────────────
     @staticmethod
     def _sweep(
         product: str,
@@ -91,7 +84,6 @@ class Trader:
                 sell_cap -= vol
         return orders, buy_cap, sell_cap
 
-    # ── single-level market making (EMERALDS) ─────────────────────
     @staticmethod
     def _make_single(
         product: str,
@@ -118,7 +110,6 @@ class Trader:
             orders.append(Order(product, ask, -sell_cap))
         return orders
 
-    # ── two-level market making (TOMATOES) ─────────────────────────
     @staticmethod
     def _make_two_level(
         product: str,
@@ -161,7 +152,6 @@ class Trader:
                 orders.append(Order(product, ask2, -q2))
         return orders
 
-    # ── main entry ─────────────────────────────────────────────────
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
         saved: Dict[str, float] = {}
         if state.traderData:
@@ -181,20 +171,16 @@ class Trader:
             orders: List[Order] = []
 
             if product == "EMERALDS":
-                # Sweep any rare mispriced orders first
                 sweep, buy_cap, sell_cap = self._sweep(
                     product, float(EM_FV), EM_TAKE, od, buy_cap, sell_cap,
                 )
                 orders += sweep
-
-                # Single-level quoting at edge=7 (1 tick inside bot spread)
                 orders += self._make_single(
                     product, float(EM_FV), EM_EDGE, EM_SKEW,
                     pos, buy_cap, sell_cap,
                 )
 
             elif product == "TOMATOES":
-                # EMA fair value
                 wmid = self._weighted_mid(od)
                 saved[product] = (
                     TOM_ALPHA * wmid
@@ -202,21 +188,18 @@ class Trader:
                 )
                 fv = saved[product]
 
-                # Sweep mispriced orders
                 sweep, buy_cap, sell_cap = self._sweep(
                     product, fv, TOM_TAKE, od, buy_cap, sell_cap,
                 )
                 orders += sweep
 
-                # Adaptive edge from current spread
                 best_bid = max(od.buy_orders)
                 best_ask = min(od.sell_orders)
                 half_spread = (best_ask - best_bid) // 2
                 make_edge = max(TOM_MIN_EDGE, half_spread - TOM_SPREAD_OFF)
 
-                # Two-level market making (outer = inner + 1)
                 orders += self._make_two_level(
-                    product, fv, make_edge, make_edge + 1,
+                    product, fv, make_edge, make_edge + 2,
                     TOM_SKEW, pos, buy_cap, sell_cap,
                 )
 

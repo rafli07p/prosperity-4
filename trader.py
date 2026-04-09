@@ -28,25 +28,24 @@ LIMITS: Dict[str, int] = {
     "TOMATOES": 80,
 }
 
-# ── EMERALDS: stationary at 10000, spread 16 (bots at 9992/10008) ──
+# Emeralds
 EM_FV = 10_000
-EM_EDGE = 7           # 1 tick inside bot spread → captures all market trades at max edge
-EM_TAKE = 1           # sweep mispriced orders (asks ≤ 9999, bids ≥ 10001)
-EM_SKEW = 0.15        # light skew: stationary asset has no inventory risk
+EM_EDGE = 7           
+EM_TAKE = 1           
+EM_SKEW = 0.15        
 
-# ── TOMATOES: drifts, mean-reverts at lag-1 (autocorr −0.40) ──────
-TOM_ALPHA = 0.50      # EMA alpha for fair-value tracking
-TOM_TAKE = 2          # sweep threshold (ticks from FV)
-TOM_MIN_EDGE = 3      # minimum market-making edge
-TOM_SPREAD_OFF = 2    # make_edge = max(MIN_EDGE, half_spread − OFF)
-TOM_SKEW = 0.50       # stronger skew: drift creates real inventory risk
-
-INNER_RATIO = 0.65    # two-level quoting: fraction of volume on inner level
+# Tomatoes
+TOM_ALPHA = 0.50      
+TOM_TAKE = 2          
+TOM_MIN_EDGE = 3      
+TOM_SPREAD_OFF = 2    
+TOM_SKEW = 0.50       
+INNER_RATIO = 0.65    
 
 
 class Trader:
 
-    # ── fair-value helpers ─────────────────────────────────────────
+    # fair-value helpers
     @staticmethod
     def _weighted_mid(od: OrderDepth) -> float:
         best_bid = max(od.buy_orders)
@@ -64,7 +63,7 @@ class Trader:
         lim = LIMITS[product]
         return lim - pos, lim + pos          # buy_cap, sell_cap
 
-    # ── aggressive sweep (take mispriced book orders) ──────────────
+    # aggressive sweep (take mispriced book orders) 
     @staticmethod
     def _sweep(
         product: str,
@@ -91,7 +90,7 @@ class Trader:
                 sell_cap -= vol
         return orders, buy_cap, sell_cap
 
-    # ── single-level market making (EMERALDS) ─────────────────────
+    #  single-level market making (EMERALDS) 
     @staticmethod
     def _make_single(
         product: str,
@@ -118,7 +117,7 @@ class Trader:
             orders.append(Order(product, ask, -sell_cap))
         return orders
 
-    # ── two-level market making (TOMATOES) ─────────────────────────
+    # two-level market making (TOMATOES) 
     @staticmethod
     def _make_two_level(
         product: str,
@@ -161,7 +160,7 @@ class Trader:
                 orders.append(Order(product, ask2, -q2))
         return orders
 
-    # ── main entry ─────────────────────────────────────────────────
+    # main entry 
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
         saved: Dict[str, float] = {}
         if state.traderData:

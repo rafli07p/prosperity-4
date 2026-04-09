@@ -28,93 +28,147 @@ LIMITS: Dict[str, int] = {
     "TOMATOES": 80,
 }
 
-EMERALDS_FV = 10_000
-EMERALDS_EDGE = 7
+# ── EMERALDS: stationary at 10000, spread 16 (bots at 9992/10008) ──
+EM_FV = 10_000
+EM_EDGE = 7           # 1 tick inside bot spread → captures all market trades at max edge
+EM_TAKE = 1           # sweep mispriced orders (asks ≤ 9999, bids ≥ 10001)
+EM_SKEW = 0.15        # light skew: stationary asset has no inventory risk
 
-TOMATOES_ALPHA = 0.50
-TOMATOES_EDGE = 6
+# ── TOMATOES: drifts, mean-reverts at lag-1 (autocorr −0.40) ──────
+TOM_ALPHA = 0.50      # EMA alpha for fair-value tracking
+TOM_TAKE = 2          # sweep threshold (ticks from FV)
+TOM_MIN_EDGE = 3      # minimum market-making edge
+TOM_SPREAD_OFF = 2    # make_edge = max(MIN_EDGE, half_spread − OFF)
+TOM_SKEW = 0.50       # stronger skew: drift creates real inventory risk
 
-SKEW_FACTOR = 0.5
+INNER_RATIO = 0.65    # two-level quoting: fraction of volume on inner level
 
 
 class Trader:
 
+    # ── fair-value helpers ─────────────────────────────────────────
     @staticmethod
     def _weighted_mid(od: OrderDepth) -> float:
         best_bid = max(od.buy_orders)
         best_ask = min(od.sell_orders)
         bid_vol = od.buy_orders[best_bid]
         ask_vol = -od.sell_orders[best_ask]
-        return (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
+        total = bid_vol + ask_vol
+        if total == 0:
+            return (best_bid + best_ask) / 2.0
+        return (best_bid * ask_vol + best_ask * bid_vol) / total
 
     @staticmethod
-    def _capacities(product: str, state: TradingState) -> Tuple[int, int]:
+    def _caps(product: str, state: TradingState) -> Tuple[int, int]:
         pos = state.position.get(product, 0)
-        limit = LIMITS[product]
-        return limit - pos, limit + pos
+        lim = LIMITS[product]
+        return lim - pos, lim + pos          # buy_cap, sell_cap
 
+    # ── aggressive sweep (take mispriced book orders) ──────────────
     @staticmethod
     def _sweep(
-            product: str,
-            fv: float,
-            min_edge: float,
-            od: OrderDepth,
-            buy_cap: int,
-            sell_cap: int,
+        product: str,
+        fv: float,
+        threshold: float,
+        od: OrderDepth,
+        buy_cap: int,
+        sell_cap: int,
     ) -> Tuple[List[Order], int, int]:
         orders: List[Order] = []
-
         for ask in sorted(od.sell_orders):
-            if ask > fv - min_edge:
+            if ask > fv - threshold or buy_cap <= 0:
                 break
             vol = min(-od.sell_orders[ask], buy_cap)
             if vol > 0:
                 orders.append(Order(product, ask, vol))
                 buy_cap -= vol
-
         for bid in sorted(od.buy_orders, reverse=True):
-            if bid < fv + min_edge:
+            if bid < fv + threshold or sell_cap <= 0:
                 break
             vol = min(od.buy_orders[bid], sell_cap)
             if vol > 0:
                 orders.append(Order(product, bid, -vol))
                 sell_cap -= vol
-
         return orders, buy_cap, sell_cap
 
+    # ── single-level market making (EMERALDS) ─────────────────────
     @staticmethod
-    def _make(
-            product: str,
-            fv: float,
-            edge: int,
-            pos: int,
-            buy_cap: int,
-            sell_cap: int,
+    def _make_single(
+        product: str,
+        fv: float,
+        edge: int,
+        skew_factor: float,
+        pos: int,
+        buy_cap: int,
+        sell_cap: int,
     ) -> List[Order]:
-        limit = LIMITS[product]
-        skew = -int(SKEW_FACTOR * edge * pos / limit)
+        lim = LIMITS[product]
+        skew = -int(skew_factor * edge * pos / lim)
+        bid = round(fv) - edge + skew
+        ask = round(fv) + edge + skew
 
-        bid_price = round(fv) - edge + skew
-        ask_price = round(fv) + edge + skew
-
-        if bid_price >= ask_price:
-            bid_price = round(fv) - 1
-            ask_price = round(fv) + 1
+        if bid >= ask:
+            bid = round(fv) - 1
+            ask = round(fv) + 1
 
         orders: List[Order] = []
         if buy_cap > 0:
-            orders.append(Order(product, bid_price, buy_cap))
+            orders.append(Order(product, bid, buy_cap))
         if sell_cap > 0:
-            orders.append(Order(product, ask_price, -sell_cap))
+            orders.append(Order(product, ask, -sell_cap))
         return orders
 
+    # ── two-level market making (TOMATOES) ─────────────────────────
+    @staticmethod
+    def _make_two_level(
+        product: str,
+        fv: float,
+        edge_inner: int,
+        edge_outer: int,
+        skew_factor: float,
+        pos: int,
+        buy_cap: int,
+        sell_cap: int,
+    ) -> List[Order]:
+        lim = LIMITS[product]
+        skew = -int(skew_factor * edge_inner * pos / lim)
+
+        bid1 = round(fv) - edge_inner + skew
+        ask1 = round(fv) + edge_inner + skew
+        bid2 = round(fv) - edge_outer + skew
+        ask2 = round(fv) + edge_outer + skew
+
+        if bid1 >= ask1:
+            orders: List[Order] = []
+            if buy_cap > 0:
+                orders.append(Order(product, round(fv) - 1, buy_cap))
+            if sell_cap > 0:
+                orders.append(Order(product, round(fv) + 1, -sell_cap))
+            return orders
+
+        orders: List[Order] = []
+        if buy_cap > 0:
+            q1 = max(1, int(buy_cap * INNER_RATIO)) if buy_cap >= 2 else buy_cap
+            q2 = buy_cap - q1
+            orders.append(Order(product, bid1, q1))
+            if q2 > 0:
+                orders.append(Order(product, bid2, q2))
+        if sell_cap > 0:
+            q1 = max(1, int(sell_cap * INNER_RATIO)) if sell_cap >= 2 else sell_cap
+            q2 = sell_cap - q1
+            orders.append(Order(product, ask1, -q1))
+            if q2 > 0:
+                orders.append(Order(product, ask2, -q2))
+        return orders
+
+    # ── main entry ─────────────────────────────────────────────────
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
-        ema: Dict[str, float] = {}
+        saved: Dict[str, float] = {}
         if state.traderData:
             try:
-                ema = json.loads(state.traderData)
+                saved = json.loads(state.traderData)
             except (json.JSONDecodeError, ValueError, TypeError):
-                ema = {}
+                saved = {}
 
         result: Dict[str, List[Order]] = {}
 
@@ -123,36 +177,50 @@ class Trader:
                 continue
 
             pos = state.position.get(product, 0)
-            buy_cap, sell_cap = self._capacities(product, state)
+            buy_cap, sell_cap = self._caps(product, state)
             orders: List[Order] = []
 
             if product == "EMERALDS":
-                orders += self._make(
-                    product, float(EMERALDS_FV), EMERALDS_EDGE,
+                # Sweep any rare mispriced orders first
+                sweep, buy_cap, sell_cap = self._sweep(
+                    product, float(EM_FV), EM_TAKE, od, buy_cap, sell_cap,
+                )
+                orders += sweep
+
+                # Single-level quoting at edge=7 (1 tick inside bot spread)
+                orders += self._make_single(
+                    product, float(EM_FV), EM_EDGE, EM_SKEW,
                     pos, buy_cap, sell_cap,
                 )
 
             elif product == "TOMATOES":
-                weighted_mid = self._weighted_mid(od)
-                ema[product] = (
-                        TOMATOES_ALPHA * weighted_mid
-                        + (1.0 - TOMATOES_ALPHA) * ema.get(product, weighted_mid)
+                # EMA fair value
+                wmid = self._weighted_mid(od)
+                saved[product] = (
+                    TOM_ALPHA * wmid
+                    + (1.0 - TOM_ALPHA) * saved.get(product, wmid)
                 )
-                fv = ema[product]
+                fv = saved[product]
 
-                take_threshold = TOMATOES_EDGE * 1.5
-                orders, buy_cap, sell_cap = self._sweep(
-                    product, fv, take_threshold, od, buy_cap, sell_cap,
+                # Sweep mispriced orders
+                sweep, buy_cap, sell_cap = self._sweep(
+                    product, fv, TOM_TAKE, od, buy_cap, sell_cap,
                 )
+                orders += sweep
 
-                orders += self._make(
-                    product, fv, TOMATOES_EDGE,
-                    pos, buy_cap, sell_cap,
+                # Adaptive edge from current spread
+                best_bid = max(od.buy_orders)
+                best_ask = min(od.sell_orders)
+                half_spread = (best_ask - best_bid) // 2
+                make_edge = max(TOM_MIN_EDGE, half_spread - TOM_SPREAD_OFF)
+
+                # Two-level market making (outer = inner + 1)
+                orders += self._make_two_level(
+                    product, fv, make_edge, make_edge + 1,
+                    TOM_SKEW, pos, buy_cap, sell_cap,
                 )
 
             if orders:
                 result[product] = orders
 
-        trader_data = json.dumps(ema)
-
-        return result, 0, trader_data
+        return result, 0, json.dumps(saved)
